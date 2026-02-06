@@ -2,8 +2,10 @@
 Helper module for napari console.
 
 Usage:
-    from napari_spatial_tools.console_helper import plot, compare_genes, compare_samples, get_sdata
+    from napari_spatial_tools.console_helper import plot, score, total_counts, compare_genes, compare_samples
     plot('CD8A', sample=0)
+    score(['CD3D', 'CD3E'], sample=0, normalize='max', name='T_cell')
+    total_counts(sample=0, log_scale=True)
     compare_genes(['CD8A', 'EPCAM'], sample=0)
     compare_samples('CD8A', samples=[0, 1])
 """
@@ -316,6 +318,427 @@ def compare_genes(genes, sample=None, vmin=None, vmax=None, orientation='horizon
     viewer.grid.shape = _compute_grid_shape(len(genes), orientation)
     rows, cols = viewer.grid.shape
     print(f"✓ Comparing {len(genes)} genes ({rows}x{cols} grid)")
+
+
+def score(gene_list, sample=None, vmin=None, vmax=None, name=None, normalize=None, percentile=95):
+    """
+    Plot a gene score (sum of multiple genes) on cells.
+    
+    Parameters
+    ----------
+    gene_list : list of str
+        List of gene names to sum
+    sample : int or str, optional
+        Sample index (0, 1, ...) or full name
+    vmin, vmax : float or str, optional
+        Color range limits. Use 'p95' for 95th percentile
+    name : str, optional
+        Name for the score (default: "gene1+gene2+...")
+    normalize : str, optional
+        Normalization method before summing. Options:
+        - None: no normalization, sum raw counts (default)
+        - 'max': divide each gene by its maximum value
+        - 'percentile': divide each gene by its percentile value
+        - 'zscore': z-score normalization (value - mean) / std
+    percentile : float, optional
+        Percentile to use for 'percentile' normalization (default: 95)
+    
+    Examples
+    --------
+    >>> score(['CD3D', 'CD3E', 'CD8A'], sample=0, name='T_cell_score')
+    >>> score(['MKI67', 'TOP2A'], sample=0, normalize='max', name='Prolif')
+    >>> score(['CD3D', 'CD8A'], sample=0, normalize='percentile', percentile=95)
+    >>> score(['EPCAM', 'KRT8'], sample=0, normalize='zscore', name='Epithelial')
+    """
+    viewer = _get_viewer()
+    sdata = get_sdata()
+    
+    viewer.grid.enabled = False
+    _cleanup_comparison_layers(viewer)
+    
+    # Use plot logic to get the correct sample and layer
+    all_shape_names = list(sdata.shapes.keys())
+    samples = {}
+    for shape_name in all_shape_names:
+        if '-' in shape_name:
+            parts = shape_name.split('-', 1)
+            if len(parts) == 2:
+                sample_suffix = parts[1]
+                if sample_suffix not in samples:
+                    samples[sample_suffix] = []
+                samples[sample_suffix].append(shape_name)
+    
+    if not samples:
+        samples['default'] = all_shape_names
+    
+    if sample is None:
+        from napari_spatial_tools._session import get_sample_order
+        sample_order = get_sample_order()
+        if sample_order and len(sample_order) == 1:
+            sample = 0
+        elif len(samples) == 1:
+            selected_sample = list(samples.keys())[0]
+        else:
+            print(f"Error: Multiple samples found. Use: score({gene_list}, sample=INDEX_OR_NAME)")
+            print(f"Available: {list(samples.keys())}")
+            return
+    
+    if sample is not None:
+        from napari_spatial_tools._session import get_sample_order
+        sample_order = get_sample_order()
+        
+        if isinstance(sample, int):
+            if 0 <= sample < len(sample_order):
+                selected_sample = sample_order[sample]
+            else:
+                print(f"Error: Sample index {sample} out of bounds")
+                return
+        else:
+            if sample not in samples:
+                print(f"Error: Sample '{sample}' not found")
+                return
+            selected_sample = sample
+    
+    shapes_element_name = None
+    candidate_names = samples[selected_sample] if selected_sample != 'default' else all_shape_names
+    
+    for shape_name in candidate_names:
+        if 'circle' in shape_name.lower():
+            shapes_element_name = shape_name
+            break
+    
+    if shapes_element_name is None:
+        for shape_name in candidate_names:
+            if 'cell' in shape_name.lower() and 'boundar' not in shape_name.lower():
+                shapes_element_name = shape_name
+                break
+    
+    if shapes_element_name is None:
+        shapes_element_name = candidate_names[0] if candidate_names else list(sdata.shapes.keys())[0]
+    
+    print(f"Using sample: {selected_sample}, layer: {shapes_element_name}")
+    
+    # Hide other samples
+    all_samples = list(samples.keys())
+    for layer in viewer.layers:
+        layer_sample = None
+        for sample_name in all_samples:
+            if sample_name != 'default' and sample_name in layer.name:
+                layer_sample = sample_name
+                break
+        
+        if layer_sample is not None:
+            layer.visible = (layer_sample == selected_sample)
+    
+    # Add DAPI if needed
+    if hasattr(sdata, 'images') and len(sdata.images) > 0:
+        for img_name in sdata.images.keys():
+            if selected_sample != 'default' and not img_name.endswith(selected_sample):
+                continue
+            
+            if any(kw in img_name.lower() for kw in ['morphology', 'dapi', 'focus']):
+                if img_name not in [layer.name for layer in viewer.layers]:
+                    try:
+                        viewer_model = SpatialDataViewer(viewer, [sdata])
+                        img_cs = _get_coordinate_system(sdata, img_name, 'images')
+                        img_layer = viewer_model.get_sdata_image(sdata, img_name, img_cs, False)
+                        viewer.add_layer(img_layer)
+                        print(f"✓ Added DAPI layer: {img_name}")
+                    except Exception as e:
+                        print(f"Note: Could not add DAPI: {e}")
+                break
+    
+    # Get or create shapes layer
+    shapes_layer = None
+    for layer in viewer.layers:
+        if layer.name == shapes_element_name and type(layer).__name__ == 'Points':
+            shapes_layer = layer
+            break
+    
+    if shapes_layer is None:
+        print(f"Adding layer: {shapes_element_name}")
+        try:
+            viewer_model = SpatialDataViewer(viewer, [sdata])
+            cs = _get_coordinate_system(sdata, shapes_element_name)
+            shapes_layer = viewer_model.get_sdata_circles(sdata, shapes_element_name, cs, False)
+            viewer.add_layer(shapes_layer)
+            print(f"✓ Added layer: {shapes_element_name}")
+        except Exception as e:
+            import traceback
+            print(f"Error: Could not add layer: {e}")
+            print(traceback.format_exc())
+            return
+    
+    # Get table
+    if not hasattr(sdata, 'tables') or len(sdata.tables) == 0:
+        print("Error: No expression table found")
+        return
+    
+    table_name = None
+    for tbl_name in sdata.tables.keys():
+        if selected_sample != 'default' and tbl_name.endswith(selected_sample):
+            table_name = tbl_name
+            break
+    
+    if table_name is None:
+        table_name = list(sdata.tables.keys())[0]
+    
+    table = sdata.tables[table_name]
+    
+    # Sum expression for all genes (with optional normalization)
+    score_values = np.zeros(table.shape[0])
+    found_genes = []
+    missing_genes = []
+    
+    for gene_name in gene_list:
+        if gene_name in table.var_names:
+            gene_idx = list(table.var_names).index(gene_name)
+            expression = table.X[:, gene_idx]
+            
+            if hasattr(expression, 'toarray'):
+                expression = expression.toarray().flatten()
+            else:
+                expression = np.asarray(expression).flatten()
+            
+            # Apply normalization
+            if normalize == 'max':
+                max_val = expression.max()
+                if max_val > 0:
+                    expression = expression / max_val
+            elif normalize == 'percentile':
+                percentile_val = np.percentile(expression, percentile)
+                if percentile_val > 0:
+                    expression = expression / percentile_val
+            elif normalize == 'zscore':
+                mean_val = expression.mean()
+                std_val = expression.std()
+                if std_val > 0:
+                    expression = (expression - mean_val) / std_val
+                else:
+                    expression = expression - mean_val
+            
+            score_values += expression
+            found_genes.append(gene_name)
+        else:
+            missing_genes.append(gene_name)
+    
+    if not found_genes:
+        print(f"Error: None of the genes found in the data")
+        print(f"Available (first 20): {list(table.var_names[:20])}")
+        return
+    
+    if missing_genes:
+        print(f"Warning: {len(missing_genes)} genes not found: {missing_genes}")
+    
+    # Apply colors
+    vmin_val = _parse_vlim(vmin, score_values) or score_values.min()
+    vmax_val = _parse_vlim(vmax, score_values) or score_values.max()
+    
+    if vmax_val <= vmin_val:
+        vmax_val = vmin_val + 1
+        print(f"Warning: vmax collapsed, adjusted to {vmax_val:.2f}")
+    
+    norm_values = np.clip((score_values - vmin_val) / (vmax_val - vmin_val), 0, 1)
+    shapes_layer.face_color = cm.get_cmap('viridis')(norm_values)
+    
+    # Store score in features
+    score_name = name if name else '+'.join(gene_list)
+    if not hasattr(shapes_layer, 'features'):
+        shapes_layer.features = {}
+    shapes_layer.features[score_name] = score_values
+    
+    norm_method = normalize if normalize else 'raw counts'
+    if normalize == 'percentile':
+        norm_method = f'percentile (p{percentile})'
+    
+    print(f"✓ Updated {len(score_values)} cells with score '{score_name}'")
+    print(f"  Genes used ({len(found_genes)}): {', '.join(found_genes)}")
+    print(f"  Normalization: {norm_method}")
+    print(f"  Score range: {score_values.min():.2f} - {score_values.max():.2f}")
+    print(f"  Display range: vmin={vmin_val:.2f}, vmax={vmax_val:.2f}")
+
+
+def total_counts(sample=None, vmin=None, vmax=None, log_scale=False):
+    """
+    Plot total RNA counts per cell.
+    
+    Parameters
+    ----------
+    sample : int or str, optional
+        Sample index (0, 1, ...) or full name
+    vmin, vmax : float or str, optional
+        Color range limits. Use 'p95' for 95th percentile
+    log_scale : bool
+        If True, display log10(counts + 1) instead of raw counts
+    
+    Examples
+    --------
+    >>> total_counts(sample=0)
+    >>> total_counts(sample=0, log_scale=True)
+    >>> total_counts(sample=0, vmin='p5', vmax='p95', log_scale=True)
+    """
+    viewer = _get_viewer()
+    sdata = get_sdata()
+    
+    viewer.grid.enabled = False
+    _cleanup_comparison_layers(viewer)
+    
+    all_shape_names = list(sdata.shapes.keys())
+    samples = {}
+    for name in all_shape_names:
+        if '-' in name:
+            parts = name.split('-', 1)
+            if len(parts) == 2:
+                sample_suffix = parts[1]
+                if sample_suffix not in samples:
+                    samples[sample_suffix] = []
+                samples[sample_suffix].append(name)
+    
+    if not samples:
+        samples['default'] = all_shape_names
+    
+    if sample is None:
+        from napari_spatial_tools._session import get_sample_order
+        sample_order = get_sample_order()
+        if sample_order and len(sample_order) == 1:
+            sample = 0
+        elif len(samples) == 1:
+            selected_sample = list(samples.keys())[0]
+        else:
+            print(f"Error: Multiple samples found. Use: total_counts(sample=INDEX_OR_NAME)")
+            print(f"Available: {list(samples.keys())}")
+            return
+    
+    if sample is not None:
+        from napari_spatial_tools._session import get_sample_order
+        sample_order = get_sample_order()
+        
+        if isinstance(sample, int):
+            if 0 <= sample < len(sample_order):
+                selected_sample = sample_order[sample]
+            else:
+                print(f"Error: Sample index {sample} out of bounds")
+                return
+        else:
+            if sample not in samples:
+                print(f"Error: Sample '{sample}' not found")
+                return
+            selected_sample = sample
+    
+    shapes_element_name = None
+    candidate_names = samples[selected_sample] if selected_sample != 'default' else all_shape_names
+    
+    for name in candidate_names:
+        if 'circle' in name.lower():
+            shapes_element_name = name
+            break
+    
+    if shapes_element_name is None:
+        for name in candidate_names:
+            if 'cell' in name.lower() and 'boundar' not in name.lower():
+                shapes_element_name = name
+                break
+    
+    if shapes_element_name is None:
+        shapes_element_name = candidate_names[0] if candidate_names else list(sdata.shapes.keys())[0]
+    
+    print(f"Using sample: {selected_sample}, layer: {shapes_element_name}")
+    
+    all_samples = list(samples.keys())
+    for layer in viewer.layers:
+        layer_sample = None
+        for sample_name in all_samples:
+            if sample_name != 'default' and sample_name in layer.name:
+                layer_sample = sample_name
+                break
+        
+        if layer_sample is not None:
+            layer.visible = (layer_sample == selected_sample)
+    
+    if hasattr(sdata, 'images') and len(sdata.images) > 0:
+        for img_name in sdata.images.keys():
+            if selected_sample != 'default' and not img_name.endswith(selected_sample):
+                continue
+            
+            if any(kw in img_name.lower() for kw in ['morphology', 'dapi', 'focus']):
+                if img_name not in [layer.name for layer in viewer.layers]:
+                    try:
+                        viewer_model = SpatialDataViewer(viewer, [sdata])
+                        img_cs = _get_coordinate_system(sdata, img_name, 'images')
+                        img_layer = viewer_model.get_sdata_image(sdata, img_name, img_cs, False)
+                        viewer.add_layer(img_layer)
+                        print(f"✓ Added DAPI layer: {img_name}")
+                    except Exception as e:
+                        print(f"Note: Could not add DAPI: {e}")
+                break
+    
+    shapes_layer = None
+    for layer in viewer.layers:
+        if layer.name == shapes_element_name and type(layer).__name__ == 'Points':
+            shapes_layer = layer
+            break
+    
+    if shapes_layer is None:
+        print(f"Adding layer: {shapes_element_name}")
+        try:
+            viewer_model = SpatialDataViewer(viewer, [sdata])
+            cs = _get_coordinate_system(sdata, shapes_element_name)
+            shapes_layer = viewer_model.get_sdata_circles(sdata, shapes_element_name, cs, False)
+            viewer.add_layer(shapes_layer)
+            print(f"✓ Added layer: {shapes_element_name}")
+        except Exception as e:
+            import traceback
+            print(f"Error: Could not add layer: {e}")
+            print(traceback.format_exc())
+            return
+    
+    if not hasattr(sdata, 'tables') or len(sdata.tables) == 0:
+        print("Error: No expression table found")
+        return
+    
+    table_name = None
+    for tbl_name in sdata.tables.keys():
+        if selected_sample != 'default' and tbl_name.endswith(selected_sample):
+            table_name = tbl_name
+            break
+    
+    if table_name is None:
+        table_name = list(sdata.tables.keys())[0]
+    
+    table = sdata.tables[table_name]
+    
+    # Calculate total counts (sum across all genes)
+    total = np.asarray(table.X.sum(axis=1)).flatten()
+    
+    # Apply log scale if requested
+    if log_scale:
+        display_values = np.log10(total + 1)
+        label = 'total_counts_log10'
+    else:
+        display_values = total
+        label = 'total_counts'
+    
+    # Apply colors
+    vmin_val = _parse_vlim(vmin, display_values) or display_values.min()
+    vmax_val = _parse_vlim(vmax, display_values) or display_values.max()
+    
+    if vmax_val <= vmin_val:
+        vmax_val = vmin_val + 1
+        print(f"Warning: vmax collapsed, adjusted to {vmax_val:.2f}")
+    
+    norm_values = np.clip((display_values - vmin_val) / (vmax_val - vmin_val), 0, 1)
+    shapes_layer.face_color = cm.get_cmap('viridis')(norm_values)
+    
+    if not hasattr(shapes_layer, 'features'):
+        shapes_layer.features = {}
+    shapes_layer.features[label] = total if not log_scale else display_values
+    
+    scale_info = " (log10 scale)" if log_scale else ""
+    print(f"✓ Updated {len(total)} cells with total counts{scale_info}")
+    print(f"  Raw counts range: {total.min():.0f} - {total.max():.0f}")
+    if log_scale:
+        print(f"  Log10 range: {display_values.min():.2f} - {display_values.max():.2f}")
+    print(f"  Display range: vmin={vmin_val:.2f}, vmax={vmax_val:.2f}")
 
 
 def plot(gene_name, sample=None, vmin=None, vmax=None, _internal_call=False):
