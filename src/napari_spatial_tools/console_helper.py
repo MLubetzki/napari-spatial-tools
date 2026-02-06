@@ -128,14 +128,29 @@ def _apply_gene_colors(layer, expression, vmin, vmax, gene_name):
 # Main Functions
 # ============================================================================
 
-def compare_samples(gene_name, samples, vmin=None, vmax=None, orientation='horizontal'):
+def compare_samples(gene_name, samples, vmin=None, vmax=None, orientation='horizontal', global_scale=True):
     """
     Compare the same gene across multiple samples in grid view.
     
+    Parameters
+    ----------
+    gene_name : str
+        Gene name to visualize
+    samples : list of int or str
+        Sample indices or names to compare
+    vmin, vmax : float or str, optional
+        Color range limits (e.g., 'p95' for 95th percentile)
+    orientation : str
+        'horizontal' (default) or 'vertical' grid layout
+    global_scale : bool
+        If True (default), use same vmin/vmax for all samples for comparison.
+        If False, compute vmin/vmax separately for each sample.
+    
     Examples
     --------
-    >>> compare_samples('CD8A', samples=[0, 1])
-    >>> compare_samples('EPCAM', samples=[0, 1, 2], vmin='p5', vmax='p95')
+    >>> compare_samples('CD8A', samples=[0, 1])  # Same scale for both
+    >>> compare_samples('EPCAM', samples=[0, 1], global_scale=False)  # Independent scales
+    >>> compare_samples('CD8A', samples=[0, 1, 2], vmin='p5', vmax='p95')
     """
     viewer = _get_viewer()
     from napari_spatial_tools._session import get_session_data, get_sample_order
@@ -149,10 +164,11 @@ def compare_samples(gene_name, samples, vmin=None, vmax=None, orientation='horiz
     viewer_model = SpatialDataViewer(viewer, [sdata])
     dapi_layers = []
     gene_layers = []
+    sample_data = []  # Store (sample_idx, sample_name, dapi_name, shapes_name, table_name, cs, gene_layer, expression)
     
+    # First pass: collect all expression data
     for idx, sample_param in enumerate(samples):
         sample_name = _resolve_sample_index(sample_param, available_samples)
-        print(f"Creating layers for sample: {sample_name}")
         
         dapi_name = _find_element(sdata, sample_name, 'images', ['dapi', 'morphology_focus'])
         shapes_name = _find_element(sdata, sample_name, 'shapes', ['cell_circles'])
@@ -164,6 +180,30 @@ def compare_samples(gene_name, samples, vmin=None, vmax=None, orientation='horiz
         
         cs = _get_coordinate_system(sdata, shapes_name)
         
+        table = sdata.tables[table_name]
+        if gene_name not in table.var_names:
+            print(f"Error: Gene '{gene_name}' not in sample {sample_name}")
+            continue
+        
+        expression = table[:, gene_name].X.toarray().flatten()
+        gene_layer = viewer_model.get_sdata_circles(sdata, shapes_name, cs, False)
+        gene_layer.name = f"sample_{idx}_{gene_name}"
+        
+        sample_data.append((idx, sample_name, dapi_name, cs, gene_layer, expression))
+    
+    # Compute global vmin/vmax if needed
+    if global_scale and sample_data:
+        all_expression = np.concatenate([data[5] for data in sample_data])
+        global_vmin = _parse_vlim(vmin, all_expression) or all_expression.min()
+        global_vmax = _parse_vlim(vmax, all_expression) or all_expression.max()
+        if global_vmax <= global_vmin:
+            global_vmax = global_vmin + 1
+        print(f"Using global scale: vmin={global_vmin:.2f}, vmax={global_vmax:.2f}")
+    
+    # Second pass: create layers and apply colors
+    for idx, sample_name, dapi_name, cs, gene_layer, expression in sample_data:
+        print(f"Creating layers for sample: {sample_name}")
+        
         if dapi_name:
             dapi_layer = viewer_model.get_sdata_image(sdata, dapi_name, cs, False)
             dapi_layer.name = f"dapi_sample_{idx}"
@@ -171,16 +211,11 @@ def compare_samples(gene_name, samples, vmin=None, vmax=None, orientation='horiz
             dapi_layer.blending = 'additive'
             dapi_layers.append(dapi_layer)
         
-        gene_layer = viewer_model.get_sdata_circles(sdata, shapes_name, cs, False)
-        gene_layer.name = f"sample_{idx}_{gene_name}"
+        if global_scale:
+            _apply_gene_colors(gene_layer, expression, global_vmin, global_vmax, gene_name)
+        else:
+            _apply_gene_colors(gene_layer, expression, vmin, vmax, gene_name)
         
-        table = sdata.tables[table_name]
-        if gene_name not in table.var_names:
-            print(f"Error: Gene '{gene_name}' not in sample {sample_name}")
-            continue
-        
-        expression = table[:, gene_name].X.toarray().flatten()
-        _apply_gene_colors(gene_layer, expression, vmin, vmax, gene_name)
         gene_layers.append(gene_layer)
     
     for layer in dapi_layers + gene_layers:
@@ -190,7 +225,8 @@ def compare_samples(gene_name, samples, vmin=None, vmax=None, orientation='horiz
     viewer.grid.enabled = True
     viewer.grid.shape = _compute_grid_shape(len(samples), orientation)
     rows, cols = viewer.grid.shape
-    print(f"✓ Comparing {gene_name} across {len(samples)} samples ({rows}x{cols} grid)")
+    scale_mode = "global scale" if global_scale else "independent scales"
+    print(f"✓ Comparing {gene_name} across {len(samples)} samples ({rows}x{cols} grid, {scale_mode})")
 
 
 def compare_genes(genes, sample=None, vmin=None, vmax=None, orientation='horizontal'):
